@@ -151,7 +151,8 @@ void sortPullOverPaths(
   const std::shared_ptr<const PlannerData> planner_data, const GoalPlannerParameters & parameters,
   const std::vector<PullOverPath> & pull_over_path_candidates,
   const GoalCandidates & goal_candidates, const PredictedObjects & static_target_objects,
-  rclcpp::Logger logger, std::vector<size_t> & sorted_path_indices);
+  rclcpp::Logger logger, std::vector<size_t> & sorted_path_indices,
+  std::shared_ptr<autoware_utils::TimeKeeper> & time_keeper);
 
 // Flag class for managing whether a certain callback is running in multi-threading
 class ScopedFlag

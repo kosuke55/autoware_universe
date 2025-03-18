@@ -685,7 +685,7 @@ TEST(BehaviorPathPlanningSafetyUtilsTest, checkObjectsCollisionRough)
 
   // Condition: no object
   auto rough_object_collision =
-    checkObjectsCollisionRough(path, objs, margin, param, use_offset_ego_point);
+    checkObjectsCollisionRough(path, objs, margin, margin, param, use_offset_ego_point);
   EXPECT_FALSE(rough_object_collision.first);
   EXPECT_FALSE(rough_object_collision.second);
 
@@ -698,7 +698,7 @@ TEST(BehaviorPathPlanningSafetyUtilsTest, checkObjectsCollisionRough)
   objs.objects.push_back(obj);
 
   rough_object_collision =
-    checkObjectsCollisionRough(path, objs, margin, param, use_offset_ego_point);
+    checkObjectsCollisionRough(path, objs, margin, margin, param, use_offset_ego_point);
   EXPECT_TRUE(rough_object_collision.first);
   EXPECT_FALSE(rough_object_collision.second);
 
@@ -707,14 +707,14 @@ TEST(BehaviorPathPlanningSafetyUtilsTest, checkObjectsCollisionRough)
   objs.objects.clear();
   objs.objects.push_back(obj);
   rough_object_collision =
-    checkObjectsCollisionRough(path, objs, margin, param, use_offset_ego_point);
+    checkObjectsCollisionRough(path, objs, margin, margin, param, use_offset_ego_point);
   EXPECT_TRUE(rough_object_collision.first);
   EXPECT_TRUE(rough_object_collision.second);
 
   // Condition: use_offset_ego_point set to false
   use_offset_ego_point = false;
   rough_object_collision =
-    checkObjectsCollisionRough(path, objs, margin, param, use_offset_ego_point);
+    checkObjectsCollisionRough(path, objs, margin, margin, param, use_offset_ego_point);
   EXPECT_TRUE(rough_object_collision.first);
   EXPECT_TRUE(rough_object_collision.second);
 }

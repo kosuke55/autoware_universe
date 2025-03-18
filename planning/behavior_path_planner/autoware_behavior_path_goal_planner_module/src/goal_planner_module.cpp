@@ -522,9 +522,11 @@ void LaneParkingPlanner::bezier_planning_helper(
     planner_data->parameters.vehicle_width);
   const auto static_target_objects = utils::path_safety_checker::filterObjectsByVelocity(
     dynamic_target_objects, parameters_.th_moving_object_velocity);
+
+  std::shared_ptr<autoware_utils::TimeKeeper> time_keeper = nullptr;
   sortPullOverPaths(
     planner_data, parameters_, path_candidates_all, goal_candidates, static_target_objects,
-    getLogger(), sorted_indices);
+    getLogger(), sorted_indices, time_keeper);
 
   const auto clip_size = std::min<size_t>(path_candidates_all.size(), 100);
   // take upto 100 elements
@@ -1032,8 +1034,11 @@ void sortPullOverPaths(
   const std::shared_ptr<const PlannerData> planner_data, const GoalPlannerParameters & parameters,
   const std::vector<PullOverPath> & pull_over_path_candidates,
   const GoalCandidates & goal_candidates, const PredictedObjects & static_target_objects,
-  rclcpp::Logger logger, std::vector<size_t> & sorted_path_indices)
+  rclcpp::Logger logger, std::vector<size_t> & sorted_path_indices,
+  std::shared_ptr<autoware_utils::TimeKeeper> & time_keeper)
 {
+  autoware_utils::ScopedTimeTrack st(__func__, *time_keeper);
+
   const auto & soft_margins = parameters.object_recognition_collision_check_soft_margins;
   const auto & hard_margins = parameters.object_recognition_collision_check_hard_margins;
 
@@ -1082,12 +1087,40 @@ void sortPullOverPaths(
 
   // Create a map of PullOverPath pointer to largest collision check margin
   std::map<size_t, double> path_id_to_rough_margin_map;
+
+  time_keeper->start_track("create_margin_map");
   const auto & target_objects = static_target_objects;
+  std::cerr << "target_objects.size() = " << target_objects.objects.size() << std::endl;
   for (const size_t i : sorted_path_indices) {
     const auto & path = pull_over_path_candidates[i];
+
+    // check collision roughly with {min_distance, max_distance} between ego footprint and objects
+    // footprint
+    // const std::pair<bool, bool> has_collision_rough =
+    //   utils::path_safety_checker::checkObjectsCollisionRough(
+    //     path.parking_path(), target_objects, soft_margins.front(), hard_margins.back(),
+    //     planner_data->parameters, false);
+    // // min_distance > soft_margin.front() means no collision with any margin
+    // if (!has_collision_rough.first) {
+    //   path_id_to_rough_margin_map[path.id()] = soft_margins.front();
+    //   continue;
+    // }
+    // // max_distance < hard_margin.front() means collision with any margin
+    // if (has_collision_rough.second) {
+    //   path_id_to_rough_margin_map[path.id()] = 0.0;
+    //   continue;
+    // }
+
+    // const double distance = utils::path_safety_checker::calculate_distance_to_objects_from_path(
+    //   path.parking_path(), target_objects, planner_data->parameters, true);
+
+    // old
     const double distance = utils::path_safety_checker::calculateRoughDistanceToObjects(
       path.parking_path(), target_objects, planner_data->parameters, false, "max");
-    auto it = std::lower_bound(
+    
+
+
+    const auto it = std::lower_bound(
       margins_with_zero.begin(), margins_with_zero.end(), distance, std::greater<double>());
     if (it == margins_with_zero.end()) {
       path_id_to_rough_margin_map[path.id()] = margins_with_zero.back();
@@ -1095,6 +1128,7 @@ void sortPullOverPaths(
       path_id_to_rough_margin_map[path.id()] = *it;
     }
   }
+  time_keeper->end_track("create_margin_map");
 
   // sorts in descending order so the item with larger margin comes first
   std::stable_sort(
@@ -1243,7 +1277,7 @@ std::optional<PullOverPath> GoalPlannerModule::selectPullOverPath(
 
   sortPullOverPaths(
     planner_data_, parameters_, pull_over_path_candidates, goal_candidates_,
-    context_data.static_target_objects, getLogger(), sorted_path_indices);
+    context_data.static_target_objects, getLogger(), sorted_path_indices, time_keeper_);
 
   // STEP3: Select the final pull over path by checking collision to make it as high priority as
   // possible

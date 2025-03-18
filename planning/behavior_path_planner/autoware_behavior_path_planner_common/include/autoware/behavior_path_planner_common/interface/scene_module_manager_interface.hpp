@@ -78,6 +78,7 @@ public:
     observer.lock()->setData(planner_data_);
     observer.lock()->setPreviousModuleOutput(previous_module_output);
     observer.lock()->getTimeKeeper()->add_reporter(this->pub_processing_time_);
+    observer.lock()->getTimeKeeper()->add_reporter(&std::cerr);
     observer.lock()->onEntry();
 
     observers_.push_back(observer);
