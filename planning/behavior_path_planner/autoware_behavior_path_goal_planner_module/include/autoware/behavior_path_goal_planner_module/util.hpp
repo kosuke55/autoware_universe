@@ -53,7 +53,7 @@ using autoware_utils::Segment2d;
 using SegmentRtree = boost::geometry::index::rtree<Segment2d, boost::geometry::index::rstar<16>>;
 
 SegmentRtree extract_uncrossable_segments(
-  const lanelet::LaneletMap & lanelet_map, const Point & ego_point, const double max_distance);
+  const lanelet::LaneletMap & lanelet_map, const Polygon2d & extraction_polygon);
 
 bool has_types(const lanelet::ConstLineString3d & ls, const std::vector<std::string> & types);
 

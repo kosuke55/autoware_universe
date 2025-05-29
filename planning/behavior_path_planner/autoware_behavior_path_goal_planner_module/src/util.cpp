@@ -52,18 +52,18 @@ using autoware_utils::create_marker_scale;
 using autoware_utils::create_point;
 
 SegmentRtree extract_uncrossable_segments(
-  const lanelet::LaneletMap & lanelet_map, const Point & ego_point, const double max_distance)
+  const lanelet::LaneletMap & lanelet_map, const Polygon2d & extraction_polygon)
 {
   SegmentRtree uncrossable_segments_in_range;
-  LineString2d line;
-  const auto ego_p = Point2d{ego_point.x, ego_point.y};
+
+  std::vector<Point2d> line;
   for (const auto & ls : lanelet_map.lineStringLayer) {
     if (has_types(ls, {"road_border"})) {
       line.clear();
       for (const auto & p : ls) line.push_back(Point2d{p.x(), p.y()});
       for (auto segment_idx = 0LU; segment_idx + 1 < line.size(); ++segment_idx) {
         Segment2d segment = {line[segment_idx], line[segment_idx + 1]};
-        if (boost::geometry::distance(segment, ego_p) < max_distance) {
+        if (boost::geometry::intersects(segment, extraction_polygon)) {
           uncrossable_segments_in_range.insert(segment);
         }
       }
@@ -931,7 +931,7 @@ autoware_perception_msgs::msg::PredictedObjects extract_dynamic_objects(
   const double road_border_search_distance =
     parameters.objects_filtering_params.object_check_forward_distance;
   const auto road_border_segments = extract_uncrossable_segments(
-    *(route_handler.getLaneletMapPtr()), ego_pose.position, road_border_search_distance);
+    *(route_handler.getLaneletMapPtr()), objects_extraction_polygon.value());
   auto filtered_objects =
     filter_objects_by_road_border(dynamic_target_objects, road_border_segments, ego_pose, true);
 
