@@ -150,7 +150,7 @@ generate_clothoid_entry_with_yaw(
   // Entry Clothoid: linearly increase curvature from 0 to target curvature
   double target_curvature = (L / (A * A)) * direction_factor;
   double start_curvature = 0.0;
-
+cl
   // Accurate calculation using numerical integration
   double current_x = start_pose.position.x;
   double current_y = start_pose.position.y;
