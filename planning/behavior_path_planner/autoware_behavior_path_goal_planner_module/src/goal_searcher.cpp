@@ -17,6 +17,9 @@
 #include "autoware/behavior_path_goal_planner_module/util.hpp"
 #include "autoware/behavior_path_planner_common/utils/path_utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
+#include "autoware/trajectory/interpolator/linear.hpp"
+#include "autoware/trajectory/pose.hpp"
+#include "autoware/trajectory/utils/closest.hpp"
 #include "autoware_lanelet2_extension/regulatory_elements/bus_stop_area.hpp"
 #include "autoware_lanelet2_extension/regulatory_elements/no_parking_area.hpp"
 #include "autoware_lanelet2_extension/regulatory_elements/no_stopping_area.hpp"
@@ -31,6 +34,8 @@
 #include <lanelet2_core/geometry/Polygon.h>
 
 #include <algorithm>
+#include <cmath>
+#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -38,182 +43,133 @@
 namespace autoware::behavior_path_planner
 {
 
-std::vector<Pose> resampleBoundaryWithinRange(
-  const lanelet::ConstLineString3d & boundary, const Pose & reference_pose,
-  const double backward_length, const double forward_length, const double interval)
-{
-  using autoware::motion_utils::findNearestIndex;
-  using autoware_utils::calc_azimuth_angle;
-  using autoware_utils::calc_distance2d;
-  using autoware_utils::create_quaternion_from_yaw;
+using autoware_utils::calc_offset_pose;
+using lanelet::autoware::NoParkingArea;
+using lanelet::autoware::NoStoppingArea;
 
+namespace
+{
+/**
+ * @brief Convert lanelet boundary points to geometry_msgs poses with proper orientation
+ * @param boundary The lanelet boundary to convert
+ * @return Vector of poses with calculated orientations
+ */
+std::vector<geometry_msgs::msg::Pose> convertBoundaryToPoses(
+  const lanelet::ConstLineString3d & boundary)
+{
   if (boundary.size() < 2) {
     return {};
   }
 
-  // Convert linestring to pose vector for easier manipulation
-  std::vector<Pose> boundary_poses;
+  std::vector<geometry_msgs::msg::Pose> boundary_poses;
   boundary_poses.reserve(boundary.size());
 
-  for (size_t i = 0; i < boundary.size(); ++i) {
-    Pose pose;
-    pose.position.x = boundary[i].x();
-    pose.position.y = boundary[i].y();
-    pose.position.z = boundary[i].z();
+  const auto to_point = [](const auto & lanelet_point) {
+    auto point = geometry_msgs::msg::Point{};
+    point.x = lanelet_point.x();
+    point.y = lanelet_point.y();
+    point.z = lanelet_point.z();
+    return point;
+  };
 
-    // Calculate orientation based on direction to next point
-    if (i < boundary.size() - 1) {
-      geometry_msgs::msg::Point next_point;
-      next_point.x = boundary[i + 1].x();
-      next_point.y = boundary[i + 1].y();
-      next_point.z = boundary[i + 1].z();
+  const auto to_pose = [&to_point](const auto & lanelet_point) {
+    auto pose = geometry_msgs::msg::Pose{};
+    pose.position = to_point(lanelet_point);
+    return pose;
+  };
 
-      const auto azimuth = calc_azimuth_angle(pose.position, next_point);
-      pose.orientation = create_quaternion_from_yaw(azimuth);
-    } else if (i > 0) {
-      // Use previous segment's direction for the last point
-      geometry_msgs::msg::Point prev_point;
-      prev_point.x = boundary[i - 1].x();
-      prev_point.y = boundary[i - 1].y();
-      prev_point.z = boundary[i - 1].z();
-
-      const auto azimuth = calc_azimuth_angle(prev_point, pose.position);
-      pose.orientation = create_quaternion_from_yaw(azimuth);
-    }
-
-    boundary_poses.push_back(std::move(pose));
-  }
-
-  // Find exact projection point on boundary
-  const auto projection_opt = goal_planner_utils::calcClosestPose(boundary, reference_pose.position);
-  if (!projection_opt) {
-    return {};
-  }
-  const auto & projection_pose = projection_opt.value();
-
-  // Find which segment contains the projection
-  size_t segment_idx = 0;
-  double min_dist_to_segment = std::numeric_limits<double>::max();
-  
-  for (size_t i = 0; i < boundary_poses.size() - 1; ++i) {
-    const auto & p1 = boundary_poses[i].position;
-    const auto & p2 = boundary_poses[i + 1].position;
-    
-    // Check if projection is between p1 and p2
-    const double seg_length = calc_distance2d(p1, p2);
-    if (seg_length > 0.0) {
-      const double dot = ((projection_pose.position.x - p1.x) * (p2.x - p1.x) + 
-                          (projection_pose.position.y - p1.y) * (p2.y - p1.y)) / (seg_length * seg_length);
-      if (dot >= 0.0 && dot <= 1.0) {
-        // Projection is within this segment
-        segment_idx = i;
-        break;
-      }
-    }
-    
-    // If not within segment, check distance to endpoints
-    const double dist_to_p1 = calc_distance2d(projection_pose.position, p1);
-    if (dist_to_p1 < min_dist_to_segment) {
-      min_dist_to_segment = dist_to_p1;
-      segment_idx = i;
-    }
-  }
-
-  // Calculate arc length from start to projection point
-  double arc_length_to_projection = 0.0;
-  for (size_t i = 0; i < segment_idx; ++i) {
-    arc_length_to_projection += calc_distance2d(boundary_poses[i].position, boundary_poses[i + 1].position);
-  }
-  
-  // Add partial segment length
-  arc_length_to_projection += calc_distance2d(boundary_poses[segment_idx].position, projection_pose.position);
-
-  // Calculate total arc length of boundary
-  double total_boundary_length = 0.0;
-  for (size_t i = 0; i < boundary_poses.size() - 1; ++i) {
-    total_boundary_length += calc_distance2d(boundary_poses[i].position, boundary_poses[i + 1].position);
-  }
-
-  // Calculate start and end arc lengths for the range
-  const double start_arc_length = std::max(0.0, arc_length_to_projection - backward_length);
-  const double end_arc_length = std::min(total_boundary_length, arc_length_to_projection + forward_length);
-
-  if (end_arc_length <= start_arc_length) {
-    return {};
-  }
-
-  // Resample at regular intervals within the range
-  std::vector<Pose> resampled_poses;
-  const double range_length = end_arc_length - start_arc_length;
-  const size_t num_samples = static_cast<size_t>(std::ceil(range_length / interval)) + 1;
-  resampled_poses.reserve(num_samples);
-
-  // Build cumulative arc lengths for easier interpolation
-  std::vector<double> cumulative_lengths;
-  cumulative_lengths.reserve(boundary_poses.size());
-  cumulative_lengths.push_back(0.0);
-  
-  for (size_t i = 1; i < boundary_poses.size(); ++i) {
-    cumulative_lengths.push_back(
-      cumulative_lengths.back() + 
-      calc_distance2d(boundary_poses[i - 1].position, boundary_poses[i].position));
-  }
-
-  for (double s = 0.0; s <= range_length; s += interval) {
-    const double target_arc_length = start_arc_length + s;
-
-    // Find segment containing target arc length
-    const auto seg_it = std::lower_bound(
-      cumulative_lengths.begin(), cumulative_lengths.end(), target_arc_length);
-    
-    if (seg_it == cumulative_lengths.end()) {
-      // Beyond the end, use last pose
-      resampled_poses.push_back(boundary_poses.back());
-      continue;
-    }
-    
-    const size_t seg_idx = std::distance(cumulative_lengths.begin(), seg_it);
-    if (seg_idx == 0) {
-      // At or before start, use first pose
-      resampled_poses.push_back(boundary_poses.front());
-      continue;
-    }
-
-    // Interpolate within the segment
-    const size_t idx1 = seg_idx - 1;
-    const size_t idx2 = seg_idx;
-    const double seg_start = cumulative_lengths[idx1];
-    const double seg_end = cumulative_lengths[idx2];
-    const double seg_length = seg_end - seg_start;
-
-    if (seg_length > 0.0) {
-      const double ratio = (target_arc_length - seg_start) / seg_length;
-
-      // Interpolate pose
-      Pose interpolated_pose;
-      const auto & p1 = boundary_poses[idx1];
-      const auto & p2 = boundary_poses[idx2];
-
-      interpolated_pose.position.x = p1.position.x + ratio * (p2.position.x - p1.position.x);
-      interpolated_pose.position.y = p1.position.y + ratio * (p2.position.y - p1.position.y);
-      interpolated_pose.position.z = p1.position.z + ratio * (p2.position.z - p1.position.z);
-
-      // Use the segment's orientation
-      interpolated_pose.orientation = p1.orientation;
-
-      resampled_poses.push_back(std::move(interpolated_pose));
+  for (auto it = boundary.begin(); it != boundary.end(); ++it) {
+    auto pose = to_pose(*it);
+    const auto next_it = std::next(it);
+    if (next_it != boundary.end()) {
+      const auto current_pos = to_point(*it);
+      const auto next_pos = to_point(*next_it);
+      const auto yaw = autoware_utils::calc_azimuth_angle(current_pos, next_pos);
+      pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(yaw);
     } else {
-      resampled_poses.push_back(boundary_poses[idx1]);
+      pose.orientation = boundary_poses.back().orientation;
     }
+    boundary_poses.emplace_back(std::move(pose));
   }
 
-  return resampled_poses;
+  return boundary_poses;
 }
 
-// Helper function to calculate goal pose with minimum margin from boundary
+/**
+ * @brief Crop boundary points within a specified range around a reference pose
+ * @param boundary The lanelet boundary to resample
+ * @param reference_pose The reference pose to center the sampling around
+ * @param backward_length Distance to sample backward from reference
+ * @param forward_length Distance to sample forward from reference
+ * @param interval Sampling interval distance
+ * @return Vector of cropped poses
+ */
+std::vector<geometry_msgs::msg::Pose> cropBoundary(
+  const lanelet::ConstLineString3d & boundary, const geometry_msgs::msg::Pose & reference_pose,
+  const double backward_length, const double forward_length, const double interval)
+{
+  using autoware::experimental::trajectory::Trajectory;
+  using autoware::experimental::trajectory::interpolator::Linear;
+
+  const auto boundary_poses = convertBoundaryToPoses(boundary);
+  if (boundary_poses.empty()) {
+    return {};
+  }
+
+  auto pose_trajectory = Trajectory<geometry_msgs::msg::Pose>::Builder()
+                           .set_xy_interpolator<Linear>()
+                           .set_z_interpolator<Linear>()
+                           .build(boundary_poses);
+  if (!pose_trajectory) {
+    return {};
+  }
+
+  pose_trajectory->align_orientation_with_trajectory_direction();
+
+  const double reference_s =
+    autoware::experimental::trajectory::closest(*pose_trajectory, reference_pose);
+  const double start_s = std::max(0.0, reference_s - backward_length);
+  const double end_s = std::min(pose_trajectory->length(), reference_s + forward_length);
+
+  if (end_s <= start_s) {
+    return {};
+  }
+
+  std::vector<geometry_msgs::msg::Pose> cropped_poses;
+  for (double s = start_s; s < end_s; s += interval) {
+    auto pose = pose_trajectory->compute(s);
+    // NOTE:
+    // align_orientation_with_trajectory_direction only calculates the azimuth for the input to
+    // build, and the interpolated points have their orientation interpolated as well.
+    // Therefore, we recalculate the azimuth here.
+    pose.orientation =
+      autoware_utils_geometry::create_quaternion_from_yaw(pose_trajectory->azimuth(s));
+    cropped_poses.push_back(pose);
+  } 
+
+  for (double s = start_s; s < end_s; s += interval) {
+    const auto pose = pose_trajectory->compute(s);
+    cropped_poses.push_back(pose);
+  }
+
+  // debug print with trajectory azimuth
+  std::cerr << "Cropped poses with trajectory azimuth ";
+  for (double s = start_s; s < end_s; s += interval) {
+    const auto pose = pose_trajectory->compute(s);
+    const double pose_yaw = tf2::getYaw(pose.orientation);
+    const double trajectory_azimuth = pose_trajectory->azimuth(s);
+    std::cerr << "(" << pose.position.x << ", " << pose.position.y << ", pose_yaw=" << pose_yaw
+              << ", traj_azimuth=" << trajectory_azimuth << ") ";
+  }
+  std::cerr << std::endl;
+
+  return cropped_poses;
+}
+
 std::optional<Pose> calculateGoalPoseWithMinMargin(
   const Pose & front_pose, const Pose & rear_pose, const lanelet::ConstLineString3d & boundary,
-  const double base_link2front, const double margin_from_boundary, const bool left_side_parking)
+  const double base_link2front, const double margin_from_boundary, const double vehicle_half_width,
+  const bool left_side_parking)
 {
   using autoware_utils::calc_offset_pose;
   // Calculate signed distance from rear pose to boundary in y direction
@@ -225,50 +181,38 @@ std::optional<Pose> calculateGoalPoseWithMinMargin(
   }
   const auto & rear_to_boundary_pose = rear_to_boundary_pose_opt.value();
 
-  // Transform boundary position to rear pose coordinate system
-  const auto boundary_position_in_rear_frame =
-    autoware_utils::inverse_transform_point(rear_to_boundary_pose.position, rear_pose);
+  // tmp
+  const double yaw = tf2::getYaw(rear_to_boundary_pose.orientation);
+  std::cerr << "rear_to_boundary_pose: (" << rear_to_boundary_pose.position.x << ", "
+            << rear_to_boundary_pose.position.y << ", " << yaw << ") ";
 
   // In rear pose coordinate system, y component is the lateral distance to boundary
-  const double rear_pose_to_boundary_distance = boundary_position_in_rear_frame.y;
+  const double rear_to_boundary_y =
+    autoware_utils::inverse_transform_point(rear_to_boundary_pose.position, rear_pose).y;
 
   // Calculate goal pose based on parking side and rear pose position
-  Pose pose_with_min_margin_from_boundary;
+  const double offset_y = left_side_parking
+                            ? rear_to_boundary_y < 0.0
+                                // Case 1-1: Left boundary is on the right side of rear pose
+                                // Rear Pose is closer to left boundary than Front Pose.
+                                ? -(-rear_to_boundary_y + margin_from_boundary + vehicle_half_width)
+                                // Case 1-2: Left boundary is on the left side of rear pose
+                                // Front pose is closer to left boundary than Rear Pose.
+                                : -(margin_from_boundary + vehicle_half_width)
+                            : (rear_to_boundary_y < 0.0
+                                 // Case 2-1: Right boundary is on the right side of rear pose
+                                 // Front pose is closer to right boundary than Rear Pose.
+                                 ? margin_from_boundary + vehicle_half_width
+                                 // Case 2-2: Right boundary is on the left side of rear pose
+                                 // Rear Pose is closer to right boundary than Front Pose.
+                                 : rear_to_boundary_y + margin_from_boundary + vehicle_half_width);
 
-  if (left_side_parking) {
-    if (rear_pose_to_boundary_distance < 0) {
-      // Case 1-1: Left boundary is on the right side of rear pose
-      // Need to offset right by (-rear_pose_to_boundary_distance + margin_from_boundary)
-      const double offset_y = -(-rear_pose_to_boundary_distance + margin_from_boundary);
-      pose_with_min_margin_from_boundary =
-        calc_offset_pose(front_pose, -base_link2front, offset_y, 0.0);
-    } else {
-      // Case 1-2: Left boundary is on the left side of rear pose
-      // Front pose is closer to boundary, offset by -margin_from_boundary
-      pose_with_min_margin_from_boundary =
-        calc_offset_pose(front_pose, -base_link2front, -margin_from_boundary, 0.0);
-    }
-  } else {
-    if (rear_pose_to_boundary_distance < 0) {
-      // Case 2-1: Right boundary is on the right side of rear pose
-      // Front pose is closer to boundary, offset by margin_from_boundary
-      pose_with_min_margin_from_boundary =
-        calc_offset_pose(front_pose, -base_link2front, margin_from_boundary, 0.0);
-    } else {
-      // Case 2-2: Right boundary is on the left side of rear pose
-      // Need to offset left by (rear_pose_to_boundary_distance + margin_from_boundary)
-      const double offset_y = rear_pose_to_boundary_distance + margin_from_boundary;
-      pose_with_min_margin_from_boundary =
-        calc_offset_pose(front_pose, -base_link2front, offset_y, 0.0);
-    }
-  }
+  std::cerr << "front_pose : (" << front_pose.position.x << ", " << front_pose.position.y << ", "
+            << tf2::getYaw(front_pose.orientation) << ") ";
 
-  return pose_with_min_margin_from_boundary;
+  return calc_offset_pose(front_pose, -base_link2front, offset_y, 0.0);
 }
-
-using autoware_utils::calc_offset_pose;
-using lanelet::autoware::NoParkingArea;
-using lanelet::autoware::NoStoppingArea;
+}  // namespace
 
 // Sort with smaller longitudinal distances taking precedence over smaller lateral distances.
 struct SortByLongitudinalDistance
@@ -399,8 +343,9 @@ GoalCandidates GoalSearcher::search(
   const double lateral_offset_interval = use_bus_stop_area
                                            ? parameters_.bus_stop_area.lateral_offset_interval
                                            : parameters_.lateral_offset_interval;
-  const double max_lateral_offset = use_bus_stop_area ? 10.0 : parameters_.max_lateral_offset;
+  const double max_lateral_offset = parameters_.max_lateral_offset;
   const double vehicle_length = planner_data->parameters.vehicle_length;
+  const double vehicle_width = planner_data->parameters.vehicle_width;
   const double base_link2front = planner_data->parameters.base_link2front;
 
   const auto departure_check_lane = goal_planner_utils::createDepartureCheckLanelet(
@@ -408,6 +353,19 @@ GoalCandidates GoalSearcher::search(
 
   // Combine lanelets to get the boundary
   const auto pull_over_lanelet = lanelet::utils::combineLaneletsShape(pull_over_lanes_);
+
+  // pull_over_lanes_ のleft, rightをprint
+  std::cerr << "Left Bound: ";
+  for (const auto & point : pull_over_lanelet.leftBound()) {
+    std::cerr << "(" << point.x() << ", " << point.y() << ") ";
+  }
+  std::cerr << std::endl;
+  std::cerr << "Right Bound: ";
+  for (const auto & point : pull_over_lanelet.rightBound()) {
+    std::cerr << "(" << point.x() << ", " << point.y() << ") ";
+  }
+  std::cerr << std::endl;
+
   const auto boundary =
     left_side_parking_ ? pull_over_lanelet.leftBound() : pull_over_lanelet.rightBound();
 
@@ -422,23 +380,32 @@ GoalCandidates GoalSearcher::search(
                                          ? parameters_.bus_stop_area.goal_search_interval
                                          : parameters_.goal_search_interval;
 
-  const auto boundary_poses = resampleBoundaryWithinRange(
-    boundary, front_ref_pose, backward_length, forward_length, longitudinal_interval);
+  const auto boundary_poses =
+    cropBoundary(boundary, front_ref_pose, backward_length, forward_length, longitudinal_interval);
 
   size_t goal_id = 0;
   for (const auto & front_pose : boundary_poses) {
     // Calculate rear pose by offsetting backward along the orientation
+
     const Pose rear_pose = calc_offset_pose(front_pose, -vehicle_length, 0.0, 0.0);
 
     // Calculate goal pose with minimum margin from boundary
     const auto pose_with_min_margin_opt = calculateGoalPoseWithMinMargin(
-      front_pose, rear_pose, boundary, base_link2front, margin_from_boundary, left_side_parking_);
+      front_pose, rear_pose, boundary, base_link2front, margin_from_boundary, vehicle_width / 2.0,
+      left_side_parking_);
 
     if (!pose_with_min_margin_opt) {
       continue;
     }
     const auto & pose_with_min_margin_from_boundary = pose_with_min_margin_opt.value();
 
+    // debug print pose_with_min_margin_from_boundary
+    std::cerr << "pose_with_min_margin_from_boundary: ("
+              << pose_with_min_margin_from_boundary.position.x << ", "
+              << pose_with_min_margin_from_boundary.position.y << ", "
+              << tf2::getYaw(pose_with_min_margin_from_boundary.orientation) << ") ";
+
+    // todo: arc lengthでやるべき
     const double longitudinal_distance_from_original_goal =
       autoware_utils::inverse_transform_point(
         pose_with_min_margin_from_boundary.position, reference_goal_pose)
@@ -463,18 +430,18 @@ GoalCandidates GoalSearcher::search(
       if (goal_planner_utils::isIntersectingAreas(
             transformed_vehicle_footprint, no_parking_area_polygons_)) {
         // break here to exclude goals located laterally in no_parking_areas
-        // break;
+        break;
       }
 
       if (goal_planner_utils::isIntersectingAreas(
             transformed_vehicle_footprint, no_stopping_area_polygons_)) {
         // break here to exclude goals located laterally in no_stopping_areas
-        // break;
+        break;
       }
 
       if (!boost::geometry::within(
             transformed_vehicle_footprint, departure_check_lane.polygon2d().basicPolygon())) {
-        // continue;
+        continue;
       }
 
       if (!has_added_min_margin_goal) {
@@ -493,6 +460,17 @@ GoalCandidates GoalSearcher::search(
     }
   }
   createAreaPolygons(min_margin_from_boundary_goal_poses, planner_data);
+
+  // debug print goalpose x,y, yaw
+  std::cerr << std::endl;
+  std::cerr << "Goal candidates: ";
+  for (size_t i = 0; i < goal_candidates.size(); ++i) {
+    const auto & goal_pose = goal_candidates[i].goal_pose;
+    const double yaw = tf2::getYaw(goal_pose.orientation);
+
+    std::cerr << "(" << goal_pose.position.x << ", " << goal_pose.position.y << ", " << yaw << ") ";
+  }
+  std::cerr << std::endl;
 
   return goal_candidates;
 }
