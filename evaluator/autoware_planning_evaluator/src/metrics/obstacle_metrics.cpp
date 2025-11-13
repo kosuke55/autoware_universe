@@ -68,6 +68,27 @@ Accumulator<double> calcTimeToCollision(
 
   const autoware_utils::LinearRing2d local_ego_footprint = vehicle_info.createFootprint();
 
+  // Calculate trajectory bounding box for coarse filtering
+  double traj_min_x = std::numeric_limits<double>::max();
+  double traj_max_x = std::numeric_limits<double>::lowest();
+  double traj_min_y = std::numeric_limits<double>::max();
+  double traj_max_y = std::numeric_limits<double>::lowest();
+  
+  for (const auto & point : traj.points) {
+    const auto & pos = point.pose.position;
+    traj_min_x = std::min(traj_min_x, pos.x);
+    traj_max_x = std::max(traj_max_x, pos.x);
+    traj_min_y = std::min(traj_min_y, pos.y);
+    traj_max_y = std::max(traj_max_y, pos.y);
+  }
+  
+  // Add safety margin for filtering (consider obstacle size and movement)
+  constexpr double filter_margin = 10.0;  // [m] Conservative margin for obstacle filtering
+  traj_min_x -= filter_margin;
+  traj_max_x += filter_margin;
+  traj_min_y -= filter_margin;
+  traj_max_y += filter_margin;
+
   // Dynamic obstacle data struct
   struct DynamicObstacle
   {
@@ -157,9 +178,24 @@ Accumulator<double> calcTimeToCollision(
     }
   };
 
-  // Initialize dynamic obstacles
-  std::vector<DynamicObstacle> dynamic_obstacles(
-    obstacles.objects.begin(), obstacles.objects.end());
+  // Filter obstacles: keep only those within or near trajectory bounding box
+  std::vector<DynamicObstacle> dynamic_obstacles;
+  dynamic_obstacles.reserve(obstacles.objects.size());
+  
+  for (const auto & obj : obstacles.objects) {
+    const auto & pos = obj.kinematics.initial_pose_with_covariance.pose.position;
+    
+    // Coarse bounding box check
+    if (pos.x >= traj_min_x && pos.x <= traj_max_x &&
+        pos.y >= traj_min_y && pos.y <= traj_max_y) {
+      dynamic_obstacles.emplace_back(obj);
+    }
+  }
+  
+  // Early return if no relevant obstacles after filtering
+  if (dynamic_obstacles.empty()) {
+    return stat;
+  }
 
   // Find closest point to ego before starting calculate ttc
   size_t p0_index = 0;
